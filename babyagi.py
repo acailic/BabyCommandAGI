@@ -97,6 +97,11 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 ANTHROPIC_API_KEY= os.getenv("ANTHROPIC_API_KEY", "")
 GOOGLE_AI_STUDIO_API_KEY =  os.getenv("GOOGLE_AI_STUDIO_API_KEY", "")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "")
+ANTHROPIC_BASE_URL = os.getenv("ANTHROPIC_BASE_URL", "")
+
+# Default temperature; model-specific blocks below may override
+TEMPERATURE = float(os.getenv("OPENAI_TEMPERATURE", "0.0"))
 
 
 if not (LLM_MODEL.startswith("llama") or LLM_MODEL.startswith("human")):
@@ -146,6 +151,9 @@ MAX_GPT_4_5_PREVIEW_INPUT_TOKEN = 128 * 1024
 # https://platform.openai.com/docs/models/gpt-4o
 MAX_CHATGPT_4O_LATEST_OUTPUT_TOKEN = 16 * 1024
 MAX_CHATGPT_4O_LATEST_INPUT_TOKEN = 128 * 1024
+# GLM-4.6 guidance: ~8k output per https://x.com/alexalbert__/status/1812921642143900036
+MAX_GLM_4_6_OUTPUT_TOKEN = 8 * 1024
+MAX_GLM_4_6_INPUT_TOKEN = 128 * 1024
 
 
 MAX_COMMAND_RESULT_TOKEN = 8 * 1024
@@ -342,6 +350,17 @@ elif LLM_MODEL.startswith("chatgpt-4o-latest"):
         + "\033[0m\033[0m"
     )
 
+elif LLM_MODEL.startswith("glm-4.6") or LLM_MODEL.startswith("glm-4v"):
+    MAX_MODEL_OUTPUT_TOKEN = MAX_GLM_4_6_OUTPUT_TOKEN
+    MAX_MODEL_INPUT_TOKEN = MAX_GLM_4_6_INPUT_TOKEN
+    TEMPERATURE = float(os.getenv("OPENAI_TEMPERATURE", "0.0"))
+
+    log(
+        "\033[91m\033[1m"
+        + "\n*****USING GLM 4.x. 8K max output guidance.*****"
+        + "\033[0m\033[0m"
+    )
+
 elif LLM_MODEL.startswith("claude-3-7-sonnet"):
     if "-thinking" in LLM_MODEL.lower():
         MAX_MODEL_OUTPUT_TOKEN = MAX_CLAUDE_3_7_SONNET_THINKING_OUTPUT_TOKEN
@@ -399,9 +418,28 @@ log(
 log("\033[94m\033[1m" + "\n*****OBJECTIVE*****\n" + "\033[0m\033[0m")
 log(f"{OBJECTIVE}")
 
+def create_anthropic_client():
+    """
+    Create an Anthropic client, optionally pointing to a custom base URL.
+    """
+    kwargs = {"api_key": ANTHROPIC_API_KEY}
+    if ANTHROPIC_BASE_URL:
+        kwargs["base_url"] = ANTHROPIC_BASE_URL
+    return Anthropic(**kwargs)
+
+
+def create_openai_client():
+    """
+    Create an OpenAI client, optionally pointing to a custom base URL.
+    """
+    kwargs = {"api_key": OPENAI_API_KEY}
+    if OPENAI_BASE_URL:
+        kwargs["base_url"] = OPENAI_BASE_URL
+    return OpenAI(**kwargs)
+
 # Configure client
-anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY)
-openai_client = OpenAI(api_key=OPENAI_API_KEY)
+anthropic_client = create_anthropic_client()
+openai_client = create_openai_client()
 genai.configure(api_key=GOOGLE_AI_STUDIO_API_KEY)
 
 # Task storage supporting only a single instance of BabyAGI
@@ -470,6 +508,10 @@ class SingleTaskListStorage:
             length = int(len(encoded) * (1.0 - 0.2))
 
             return MAX_DUPLICATE_COMMAND_RESULT_TOKEN <= length
+        elif TOKEN_COUNT_MODEL.lower().startswith("glm-") or TOKEN_COUNT_MODEL.lower().startswith("openai/o1"):
+            encoding = tiktoken.encoding_for_model('gpt-4o')
+            encoded = encoding.encode(string)
+            return MAX_DUPLICATE_COMMAND_RESULT_TOKEN <= len(encoded)
         else:
             try:
                 encoding = tiktoken.encoding_for_model(TOKEN_COUNT_MODEL)
@@ -522,6 +564,9 @@ def limit_tokens_from_string(string: str, model: str, limit: int) -> str:
         except:
             encoding = tiktoken.encoding_for_model('gpt-4o')  # Fallback for others.
         limit = int(limit * (1.0 - 0.2))
+    elif model.lower().startswith("glm-") or model.lower().startswith("openai/o1"):
+        # Tokenizer not available; approximate with gpt-4o as suggested by OpenAI tiktoken guidance.
+        encoding = tiktoken.encoding_for_model('gpt-4o')
     else:
         try:
             encoding = tiktoken.encoding_for_model(model)
@@ -546,6 +591,8 @@ def last_tokens_from_string(string: str, model: str, last: int) -> str:
         except:
             encoding = tiktoken.encoding_for_model('gpt-4o')  # Fallback for others.
         last = int(last * (1.0 - 0.2))
+    elif model.lower().startswith("glm-") or model.lower().startswith("openai/o1"):
+        encoding = tiktoken.encoding_for_model('gpt-4o')
     else:
         try:
             encoding = tiktoken.encoding_for_model(model)
@@ -687,7 +734,9 @@ def llm_call(
     temperature: float = TEMPERATURE,
     max_tokens: int = MAX_OUTPUT_TOKEN,
 ):
+    attempts = 0
     while True:
+        attempts += 1
         try:
             if model.lower().startswith("llama"):
                 result = llm(prompt[:CTX_MAX],
@@ -744,7 +793,7 @@ def llm_call(
                 return response.text.strip()
             elif model.lower().startswith("claude"):
 
-                anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY)
+                anthropic_client = create_anthropic_client()
 
                 separated_content = separate_markdown(prompt) # for Vision API
                 if len(separated_content) > 1:
@@ -860,7 +909,7 @@ def llm_call(
                     base_url="https://openrouter.ai/api/v1",
                     api_key=OPENROUTER_API_KEY)
 
-                log(f"【MODEL】: OpenRouter {model}")
+                log(f"【MODEL】: OpenRouter {model} base_url:https://openrouter.ai/api/v1")
 
                 messages = [{"role": "system", "content": prompt}]
                 response = openai_client.chat.completions.create(
@@ -878,16 +927,20 @@ def llm_call(
 
             else:
 
-                openai_client = OpenAI(api_key=OPENAI_API_KEY)
+                openai_client = create_openai_client()
 
                 separated_content = separate_markdown(prompt) # for Vision API
                 if len(separated_content) > 1:
 
-                    log(f"【MODEL】:{LLM_VISION_MODEL}")
+                    effective_base_url = OPENAI_BASE_URL if OPENAI_BASE_URL else "https://api.openai.com/v1"
+                    log(f"【MODEL】:{LLM_VISION_MODEL} base_url:{effective_base_url}")
 
+                    # Some OpenAI-compatible providers (e.g., GLM) reject system-only messages;
+                    # fall back to user role for GLM models.
+                    messages_role = "user" if model.lower().startswith("glm") or LLM_VISION_MODEL.lower().startswith("glm") else "system"
                     messages = [
                         {
-                            "role": "system",
+                            "role": messages_role,
                             "content": modify_parts_to_new_format_openai(separated_content)
                         }
                     ]
@@ -903,9 +956,13 @@ def llm_call(
                     )
                 else:
 
-                    log(f"【MODEL】:{model}")
+                    effective_base_url = OPENAI_BASE_URL if OPENAI_BASE_URL else "https://api.openai.com/v1"
+                    log(f"【MODEL】:{model} base_url:{effective_base_url}")
 
-                    messages = [{"role": "system", "content": prompt}]
+                    # GLM endpoints can return "messages parameter is illegal" for system-only payloads;
+                    # use user role for GLM to match their expectations.
+                    messages_role = "user" if model.lower().startswith("glm") else "system"
+                    messages = [{"role": messages_role, "content": prompt}]
                     response = openai_client.chat.completions.create(
                         model=model,
                         messages=messages,
@@ -932,9 +989,11 @@ def llm_call(
             time.sleep(300)  # Wait seconds and try again
         except openai.APIConnectionError as e:
             log(
-                f"   *** OpenAI API connection error occurred. Check your network settings, proxy configuration, SSL certificates, or firewall rules. Waiting 300 seconds and trying again. error: {str(e)} ***"
+                f"   *** OpenAI API connection error (attempt {attempts}). Check network/proxy/SSL/firewall or base URL/key. Retrying in 15 seconds. error: {str(e)} ***"
             )
-            time.sleep(300)  # Wait seconds and try again
+            if attempts >= 3:
+                raise e
+            time.sleep(15)  # Shorter wait; fail fast after limited retries
         except openai.BadRequestError as e:
             log(
                 f"   *** OpenAI API BadRequestError. Check the documentation for the specific API method you are calling and make sure you are sending valid and complete parameters. Waiting 10 seconds and trying again. error: {str(e)} ***"
@@ -2413,4 +2472,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
